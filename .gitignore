@@ -3,3 +3,4 @@ __pycache__/
 *.pkl
 data/logs_regmc.json
 *.tmp
+data/logs_regmc.json.lock

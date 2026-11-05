@@ -9,6 +9,7 @@ points. Resumable: paging always goes back from the newest replay and skips repl
 """
 
 import argparse
+import collections
 import json
 import os
 import time
@@ -42,6 +43,23 @@ def get_json(url, delay, tries=6):
             err = e
         print(f"  retry {k + 1}/{tries - 1} after {err!r}: {url}", flush=True)
     raise RuntimeError(f"giving up on {url}")
+
+
+def single_instance(path=LOGS_OUT + ".lock"):
+    """Exit if another fetch is running: two would overwrite each other's saves. The OS releases the lock when
+    the process dies, so a crash leaves nothing stale. Keep the returned file open for the whole run."""
+    f = open(path, "a+")
+    f.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        raise SystemExit(f"another fetch_regmc.py is already fetching ({path} is locked)")
+    return f
 
 
 def save(logs, path=LOGS_OUT):
@@ -99,7 +117,7 @@ def player_ratings(lines):
 def build_pool(logs):
     """Unique teams that Ninjask simulates fully, best rating of a player who used it first. Returns (teams, meta)."""
     dx = ninjask.dex(DEX_FORMAT)
-    seen, problems = {}, 0
+    seen, rejected = {}, collections.Counter()
     for rid, (uploaded, log, _) in logs.items():
         lines = log.split("\n")
         ratings = player_ratings(lines)
@@ -110,8 +128,12 @@ def build_pool(logs):
             rating = ratings.get(side)
             key = tuple(sorted(mon_key(m) for m in team.split("]")))
             if key not in seen:
-                if dx.team_problems(team):
-                    problems += 1
+                try:
+                    why = dx.team_problems(team)
+                except ValueError as e:  # a species/forme the dex doesn't know (Furfrou-Star) raises, not listed
+                    why = [str(e)]
+                if why:
+                    rejected.update(why)
                     seen[key] = None
                     continue
                 seen[key] = dict(team=team, rating=rating or 0, seen=0, last=0, replays=[])
@@ -124,7 +146,8 @@ def build_pool(logs):
             if len(e["replays"]) < 5:
                 e["replays"].append(rid)
     pool = sorted((e for e in seen.values() if e), key=lambda e: (-e["rating"], -e["seen"]))
-    print(f"pool: {len(pool)} unique teams from {len(logs)} replays ({problems} unique teams rejected by team_problems)")
+    print(f"pool: {len(pool)} unique teams from {len(logs)} replays; "
+          f"{sum(e is None for e in seen.values())} unique teams rejected, most common reasons: {rejected.most_common(5)}")
     return [e["team"] for e in pool], [{k: e[k] for k in ("rating", "seen", "last", "replays")} for e in pool]
 
 
@@ -134,6 +157,7 @@ def main():
     ap.add_argument("--delay", type=float, default=1.0, help="seconds between requests")
     args = ap.parse_args()
 
+    lock = single_instance() if args.max > 0 else None  # rebuilding the pool alone is safe at any time
     logs = json.load(open(LOGS_OUT, encoding="utf-8")) if os.path.exists(LOGS_OUT) else {}
     print(f"{len(logs)} replays on disk")
     if args.max > 0:
