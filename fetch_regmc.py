@@ -1,5 +1,9 @@
 """Download public Reg M-C Bo3 replays from Showdown and build a team pool from their team sheets.
 
+The pool is for closed-sheet (CTS) self-play: Bo3 games show both sheets, which makes them the one public
+source of complete sets (Bo1 replays show only what was revealed). The sets are also a prior for the foe's
+hidden sets when analyzing a CTS game.
+
 Usage: python fetch_regmc.py [--max 6000] [--delay 1.0]      # fetch up to --max new replays, then build the pool
        python fetch_regmc.py --max 0                          # only rebuild the pool from the logs on disk
 
@@ -20,7 +24,8 @@ import ninjask
 
 BASE = "https://replay.pokemonshowdown.com"
 SEARCH_FORMAT = "gen9championsvgc2026regmcbo3"
-DEX_FORMAT = "gen9championsvgc2026regmcots"  # Bo3 games are played with open sheets
+# We play closed sheets (CTS); Bo3 replays are just where complete sets are public. Same rules as regmcots.
+DEX_FORMAT = "gen9championsvgc2026regmc"
 LOGS_OUT = "data/logs_regmc.json"  # replay_id -> [uploadtime, log_text, rating]  (logs_regmb.json's shape + rating)
 POOL_OUT = "data/teams_regmc.txt"  # one packed team per line, best rating first
 META_OUT = "data/teams_regmc_meta.json"  # per pool line: best rating, replays seen in, newest upload, a few ids

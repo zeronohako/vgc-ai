@@ -1,12 +1,15 @@
-"""Self-play environment: many Reg M-C battles stepped together by Ninjask 0.4's `Batch`, with open team sheets.
+"""Self-play environment: many Reg M-C battles stepped together by Ninjask 0.4's `Batch`.
 
-Usage: python selfplay.py [--n 256] [--secs 20]      # random-policy benchmark on the team pool + sheet check
+Usage: python selfplay.py [--n 256] [--secs 20] [--ots]   # random-policy benchmark on the team pool
 
-`Batch` plays closed sheets even in the OTS format (it never calls `show_team_sheets`): a player sees only the
-foe's species until things are revealed. OTS is what we target, so `SelfPlay.observe` fills the foe's items,
-abilities and moves from each side's own view, which is always complete: recorded at team preview (all six
-mons) and refreshed at every later decision of that side (Mega formes, items lost). Filled foe fields keep what
-the player has seen when it knows it (an item knocked off stays "none"); moves are the sheet's four.
+Closed team sheets (CTS) by default, the setting we target first (ranked ladder, Global Challenges): a player
+sees the foe's six species at team preview and the rest only as it is revealed. `Batch` itself always plays
+closed sheets, even in the OTS format (it never calls `show_team_sheets`).
+
+`open_sheets=True` (`--ots`, for supporting OTS later) fills the foe's items, abilities and moves from each
+side's own view, which is always complete: recorded at team preview (all six mons) and refreshed at every later
+decision of that side (Mega formes, items lost). Filled foe fields keep what the player has seen when it knows
+it (an item knocked off stays "none"); moves are the sheet's four. `--ots` also checks the fill.
 """
 
 import argparse
@@ -16,7 +19,7 @@ from dataclasses import dataclass
 import numpy as np
 import ninjask
 
-FORMAT = "gen9championsvgc2026regmcots"
+FORMAT = "gen9championsvgc2026regmc"  # closed sheets; the OTS format's rules are the same
 POOL = "data/teams_regmc.txt"
 MON_IDS = 7  # species, item, ability, 4 moves (ninjask::encode::ids)
 
@@ -38,7 +41,7 @@ class Decisions:
     side: np.ndarray     # (n,) 0 = p1, 1 = p2
     preview: np.ndarray  # (n,) bool: team preview
     obs: np.ndarray      # (n, OBS_LEN) float32
-    ids: np.ndarray      # (n, 2, 6, MON_IDS) int16: own side, foe side (foe sheet filled in)
+    ids: np.ndarray      # (n, 2, 6, MON_IDS) int16: own side, foe side (0 = unknown; sheet filled in if OTS)
     actions: np.ndarray  # (rows, ACTION_WIDTH) int8: legal choices of all decisions in turn
     offsets: np.ndarray  # (n + 1,) decision k's choices are actions[offsets[k]:offsets[k + 1]]
 
@@ -57,9 +60,9 @@ class SelfPlay:
     range(d.counts()[k]). step returns the battles that ended as (slot, winner side or None, turns).
     """
 
-    def __init__(self, teams, n, seed=0, fmt=FORMAT, turn_limit=None):
+    def __init__(self, teams, n, seed=0, fmt=FORMAT, turn_limit=None, open_sheets=False):
         self.dex = ninjask.dex(fmt)
-        self.teams, self.n = teams, n
+        self.teams, self.n, self.open_sheets = teams, n, open_sheets
         self.rng = np.random.default_rng(seed)
         self.batch = ninjask.Batch(self.dex, n)
         if turn_limit:
@@ -84,8 +87,18 @@ class SelfPlay:
         o = self.batch.observe()
         n = o["n"]
         who = np.frombuffer(o["who"], np.uint32).reshape(n, 2).astype(np.int64)
-        ids = np.frombuffer(o["ids"], np.int16).reshape(n, 2, 6, MON_IDS).copy()
+        ids = np.frombuffer(o["ids"], np.int16).reshape(n, 2, 6, MON_IDS)
         b, s = who[:, 0], who[:, 1]
+        if self.open_sheets:
+            ids = self._fill_sheets(ids.copy(), b, s)
+        return Decisions(
+            battle=b, side=s, preview=np.frombuffer(o["preview"], np.uint8).astype(bool),
+            obs=np.frombuffer(o["obs"], np.float32).reshape(n, ninjask.OBS_LEN), ids=ids,
+            actions=np.frombuffer(o["actions"], np.int8).reshape(-1, ninjask.ACTION_WIDTH),
+            offsets=np.frombuffer(o["offsets"], np.uint32).astype(np.int64))
+
+    def _fill_sheets(self, ids, b, s):
+        """OTS: the foe's unknown fields from the foe's own (complete) view, matched by species."""
         # 1) every decider's own view is complete: refresh its sheet (all six mons at preview)
         own = ids[:, 0]
         sp = own[:, :, 0]
@@ -101,11 +114,7 @@ class SelfPlay:
         foe[:, :, 1] = np.where(have & (item == 0), sheet[:, :, 0], item)
         foe[:, :, 2] = np.where(have & (ability == 0), sheet[:, :, 1], ability)
         foe[:, :, 3:] = np.where(have[:, :, None], sheet[:, :, 2:], foe[:, :, 3:])
-        return Decisions(
-            battle=b, side=s, preview=np.frombuffer(o["preview"], np.uint8).astype(bool),
-            obs=np.frombuffer(o["obs"], np.float32).reshape(n, ninjask.OBS_LEN), ids=ids,
-            actions=np.frombuffer(o["actions"], np.int8).reshape(-1, ninjask.ACTION_WIDTH),
-            offsets=np.frombuffer(o["offsets"], np.uint32).astype(np.int64))
+        return ids
 
     def step(self, choices):
         """Apply one choice index per decision of the last observe(); restart finished battles.
@@ -146,16 +155,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=256)
     ap.add_argument("--secs", type=float, default=20)
+    ap.add_argument("--ots", action="store_true", help="open team sheets (fill the foe's sheet) and check the fill")
     args = ap.parse_args()
     teams = load_pool()
-    env = SelfPlay(teams, args.n)
+    env = SelfPlay(teams, args.n, open_sheets=args.ots)
     rng = np.random.default_rng(1)
     games, decisions, wins, draws, turns = 0, 0, np.zeros(2), 0, []
     checked = bad = 0
     t0 = time.perf_counter()
     while time.perf_counter() - t0 < args.secs:
         d = env.observe()
-        if games < 2000:  # the sheet check is pure Python: only on the first stretch
+        if args.ots and games < 2000:  # the sheet check is pure Python: only on the first stretch
             c, x = check_sheets(d)
             checked, bad = checked + c, bad + x
         decisions += d.n
@@ -169,7 +179,8 @@ def main():
     el = time.perf_counter() - t0
     print(f"{len(teams)} pool teams, {args.n} battles: {games / el:.0f} games/s, {decisions / el:.0f} decisions/s; "
           f"p1 wins {wins[0] / games:.1%}, draws {draws / games:.1%}, turns median {int(np.median(turns))}")
-    print(f"open sheets: {checked} foe mons checked against the foe's own view, {bad} mismatches")
+    if args.ots:
+        print(f"open sheets: {checked} foe mons checked against the foe's own view, {bad} mismatches")
 
 
 if __name__ == "__main__":
