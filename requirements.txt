@@ -1,2 +1,2 @@
-ninjask==0.3.0
+ninjask==0.4.0
 numpy
