@@ -6,7 +6,7 @@ A dashboard that analyzes a Pokémon VGC position (4 active Pokémon) and shows 
 Build order: search engine → better evaluator → bring/lead selection → UI. Python first; move hot loops to Rust only when timings demand it.
 
 ## Setup
-- `.venv` (Python 3.14) with `ninjask==0.3.0` and `numpy`. Run with `.venv/bin/python`.
+- `.venv` (Python 3.14) with `ninjask==0.3.0` and `numpy` (`requirements.txt`). Run with `.venv/bin/python` (Linux/macOS) or `.venv\Scripts\python` (Windows); commands below use the Linux form. Windows setup: `py -3.14 -m venv .venv`, then `.venv\Scripts\pip install -r requirements.txt`. Run from the repo root (`LOGS` is a relative path).
 - `data/logs_regmb.json`: 324 OTS replays (Reg M-B) from the VGC-Bench dataset (HF `cameronangliss/vgc-battle-logs`). Dict `replay_id -> [timestamp, log_text]`. The dataset only covers Reg M-A/M-B, so the format is `gen9championsvgc2026regmb` for now.
 
 ## Status (2026-11-05)
