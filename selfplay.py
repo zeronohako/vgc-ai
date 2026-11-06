@@ -321,7 +321,8 @@ class SelfPlay:
         """
         d = self.last
         res = np.frombuffer(self.batch.step([int(c) for c in choices]), np.uint8)
-        for k in np.flatnonzero((res & 1) == 0):  # accepted choices: they move mons between request positions
+        self.refused = (res & 1) == 1  # per decision of the last observe: not applied, asked again
+        for k in np.flatnonzero(~self.refused):  # accepted choices: they move mons between request positions
             st, side = self.public[d.battle[k]], int(d.side[k])
             row = d.actions[d.offsets[k] + int(choices[k])]
             if d.preview[k]:  # the order starts as the preview choice: leads first

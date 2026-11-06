@@ -18,7 +18,8 @@ names = {int(env.base[k + 1]): n for k, n in enumerate(env.dex.species_ids())}  
 rng = random.Random(0)
 # observation flags (ninjask src/encode.rs): 6 mons x 19 floats per side, then 6 side conditions
 OWN_CONDS, FOE_CONDS, FIELD0 = 114, 120 + 114, 240
-checked = {"order": 0, "own slots": 0, "foe slots": 0, "switch targets": 0, "counters": 0}
+move_id = {m: k + 1 for k, m in enumerate(env.dex.move_ids())}  # ids are dex index + 1
+checked = {"order": 0, "own slots": 0, "move order": 0, "foe slots": 0, "switch targets": 0, "counters": 0}
 bad = {k: [] for k in checked}
 
 
@@ -54,6 +55,14 @@ for step in range(600):
             hit = np.flatnonzero(d.slots[k, 0] == i + 1)
             if len(hit) != 1 or own[hit[0]] != spc:
                 bad["own slots"].append((step, b, s, i, names[spc], [names.get(int(x)) for x in own], d.slots[k, 0].tolist()))
+                continue
+            # "move j" of slot i means the j-th move of the request; the view must list the moves in that order
+            moves = req["active"][i]["moves"] if i < len(req.get("active", [])) else []
+            if len(moves) == 4:  # locked moves (recharge, Struggle) come as one entry
+                checked["move order"] += 1
+                want = [move_id.get(m["id"], -1) for m in moves]
+                if d.ids[k, 0, hit[0], 3:].tolist() != want:
+                    bad["move order"].append((step, b, s, i, want, d.ids[k, 0, hit[0], 3:].tolist()))
         foe_req = battle.request(("p2", "p1")[s])
         if foe_req:
             foe = env.base[d.ids[k, 1, :, 0]]

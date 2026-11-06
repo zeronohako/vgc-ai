@@ -4,3 +4,4 @@ __pycache__/
 data/logs_regmc.json
 *.tmp
 data/logs_regmc.json.lock
+runs/
