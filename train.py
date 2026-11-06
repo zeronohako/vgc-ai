@@ -6,7 +6,8 @@ One network (model.Net) plays both sides of `--battles` battles between random p
 Every `--steps` env steps the decisions collected train it with PPO: reward +1 win / -1 loss / 0 draw at the end
 of a game, nothing before (GAE over each player's own decisions). Every `--eval-every` iterations it plays a
 uniformly random player and logs its win rate. Checkpoint + log in runs/<NAME>/ (resumes if present, so a cloud
-session that restarts every 4 h just runs the same command again).
+session that restarts every 4 h just runs the same command again), plus a snapshot of the network every
+`--snapshot-every` iterations (snap_<iteration>.pt) for arena.py to play against.
 """
 
 import os
@@ -145,6 +146,7 @@ def main():
     ap.add_argument("--lam", type=float, default=0.95)
     ap.add_argument("--eval-every", type=int, default=5)
     ap.add_argument("--eval-games", type=int, default=256)
+    ap.add_argument("--snapshot-every", type=int, default=10, help="iterations between snapshots (0: none)")
     ap.add_argument("--threads", type=int, default=os.cpu_count() // 2)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -230,6 +232,9 @@ def main():
         torch.save({"net": net.state_dict(), "opt": opt.state_dict(), "it": it, "seconds": trained_s,
                     "decisions": decisions_total, "games": games_total, "args": vars(args)}, tmp)
         os.replace(tmp, ckpt_path)
+        if args.snapshot_every and it % args.snapshot_every == 0:
+            torch.save({"net": net.state_dict(), "it": it, "minutes": rec["minutes"], "decisions": decisions_total,
+                        "games": games_total, "args": vars(args)}, os.path.join(run, f"snap_{it:05d}.pt"))
 
 
 if __name__ == "__main__":

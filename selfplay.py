@@ -230,11 +230,19 @@ class SelfPlay:
 
     Loop: d = env.observe(); results = env.step(choices) with one index per decision, choices[k] in
     range(d.counts()[k]). step returns the battles that ended as (slot, winner side or None, turns).
+
+    matchups (arena): a fixed list of games (p1 pool index, p2 pool index, battle seed, tag) played in order
+    instead of random ones; a slot whose game ends with the list used up stays idle (`active` False), and
+    `finished` holds the tags of the games the last step() ended, in its order.
     """
 
-    def __init__(self, teams, n, seed=0, fmt=FORMAT, turn_limit=None, open_sheets=False):
+    def __init__(self, teams, n, seed=0, fmt=FORMAT, turn_limit=None, open_sheets=False, matchups=None):
         self.dex = ninjask.dex(fmt)
         self.teams, self.n, self.open_sheets = teams, n, open_sheets
+        self.queue = None if matchups is None else list(matchups)[::-1]  # popped from the end
+        self.active = np.ones(n, bool)
+        self.tag = [None] * n
+        self.finished = []
         self.rng = np.random.default_rng(seed)
         self.batch = ninjask.Batch(self.dex, n)
         if turn_limit:
@@ -252,8 +260,19 @@ class SelfPlay:
 
     def _reset(self, slots):
         slots = [int(i) for i in slots]
-        picks = self.rng.integers(len(self.teams), size=(len(slots), 2))
-        seeds = (self.games + np.arange(len(slots))).tolist()
+        if self.queue is not None:
+            games = [self.queue.pop() for _ in slots[:len(self.queue)]]
+            self.active[slots[len(games):]] = False
+            slots = slots[:len(games)]
+            if not slots:
+                return
+            picks = np.array([g[:2] for g in games], np.int64)
+            seeds = [int(g[2]) for g in games]
+            for i, g in zip(slots, games):
+                self.tag[i] = g[3]
+        else:
+            picks = self.rng.integers(len(self.teams), size=(len(slots), 2))
+            seeds = (self.games + np.arange(len(slots))).tolist()
         self.batch.reset_many(slots, [self.teams[a] for a, _ in picks], [self.teams[b] for _, b in picks], seeds)
         self.games += len(slots)
         self.pairs[slots] = picks
@@ -332,7 +351,8 @@ class SelfPlay:
             for i in range(2):
                 if row[4 * i] == 2:  # kind switch, index = 1-based request position
                     st.switched(side, i, int(row[4 * i + 1]) - 1)
-        done = np.flatnonzero(np.frombuffer(self.batch.dones(), np.uint8))
+        done = np.flatnonzero(np.frombuffer(self.batch.dones(), np.uint8) & self.active)
+        self.finished = [self.tag[i] for i in done]
         ended = []
         for i in done:
             w = self.batch.winner(int(i))
