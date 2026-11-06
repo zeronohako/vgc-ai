@@ -51,7 +51,7 @@ class Network:
     def __init__(self, path, vocab, greedy=False):
         if os.path.isdir(path):
             path = os.path.join(path, "ckpt.pt")
-        ck = torch.load(path, weights_only=False)
+        ck = torch.load(path, map_location="cpu", weights_only=False)
         a = ck["args"]
         self.net = M.Net(vocab, d=a["d"], layers=a["layers"], heads=a["heads"])
         self.net.load_state_dict(ck["net"])

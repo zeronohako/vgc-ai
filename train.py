@@ -5,9 +5,15 @@ Usage: python train.py [--minutes 30] [--run NAME] [--battles 256] [--steps 32] 
 One network (model.Net) plays both sides of `--battles` battles between random pool teams (selfplay.SelfPlay).
 Every `--steps` env steps the decisions collected train it with PPO: reward +1 win / -1 loss / 0 draw at the end
 of a game, nothing before (GAE over each player's own decisions). Every `--eval-every` iterations it plays a
-uniformly random player and logs its win rate. Checkpoint + log in runs/<NAME>/ (resumes if present, so a cloud
-session that restarts every 4 h just runs the same command again), plus a snapshot of the network every
-`--snapshot-every` iterations (snap_<iteration>.pt) for arena.py to play against.
+uniformly random player and logs its win rate. Checkpoint + log in <runs-dir>/<NAME>/ (resumes if present, so a
+cloud session that restarts just runs the same command again), plus a snapshot of the network every
+`--snapshot-every` iterations (snap_<iteration>.pt, CPU tensors) for arena.py to play against.
+
+GPU: --device cuda (the default when one is there) trains on it; the battles always run on the CPU. Moves during
+the rollouts are picked on --act-device (default: the same device); `--act-device cpu` keeps a CPU copy of the
+network for that, synced after every update, in case many small GPU calls are slow. --resume-from DIR copies a
+previous session's run folder (ckpt.pt, log.jsonl, snapshots) into the run folder first, if it has no checkpoint
+yet: a Kaggle session reads the last one's output from /kaggle/input and writes its own to /kaggle/working.
 """
 
 import os
@@ -16,6 +22,7 @@ os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")  # torch's threads mustn't s
 
 import argparse
 import json
+import shutil
 import time
 import warnings
 
@@ -90,13 +97,15 @@ class Rollout:
 
 
 def act(net, d, greedy=False):
-    """(choices, logp of each choice, value) for every decision of an observe()."""
-    t = M.to_torch(M.batch_from(d))
+    """(choices, logp of each choice, value) for every decision of an observe(), on the net's device."""
+    dev = next(net.parameters()).device
+    t = M.to_torch(M.batch_from(d), dev)
     with torch.no_grad():
         logits, value = net(t)
         lp = M.seg_log_softmax(logits, t["seg"], d.n)
         choice = M.sample(logits, t["seg"], t["offsets"], greedy)
-    return choice, lp[t["offsets"][:-1] + torch.from_numpy(choice)].numpy(), value.numpy()
+        picked = lp[t["offsets"][:-1] + torch.from_numpy(choice).to(dev)]
+    return choice, picked.cpu().numpy(), value.cpu().numpy()
 
 
 def evaluate(net, teams, games, battles=64, seed=12345):
@@ -130,6 +139,10 @@ def subset(d, k):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", default="cpu-smoke")
+    ap.add_argument("--runs-dir", default="runs")
+    ap.add_argument("--resume-from", help="a previous session's run folder, copied in if this run has no checkpoint")
+    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--act-device", help="device for picking moves in the rollouts (default: --device)")
     ap.add_argument("--minutes", type=float, default=30)
     ap.add_argument("--battles", type=int, default=256)
     ap.add_argument("--steps", type=int, default=32, help="env steps per iteration")
@@ -154,27 +167,43 @@ def main():
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
-    run = os.path.join("runs", args.run)
+    run = os.path.join(args.runs_dir, args.run)
     os.makedirs(run, exist_ok=True)
     ckpt_path, log_path = os.path.join(run, "ckpt.pt"), os.path.join(run, "log.jsonl")
+    if args.resume_from and not os.path.exists(ckpt_path):
+        for f in sorted(os.listdir(args.resume_from)):
+            if f in ("ckpt.pt", "log.jsonl") or (f.startswith("snap_") and f.endswith(".pt")):
+                shutil.copy2(os.path.join(args.resume_from, f), run)
+        print(f"copied {args.resume_from} into {run}")
+    dev, act_dev = torch.device(args.device), torch.device(args.act_device or args.device)
 
     teams = sp.load_pool()
     env = sp.SelfPlay(teams, args.battles, seed=args.seed)
-    net = M.Net(env.dex.vocab(), d=args.d, layers=args.layers, heads=args.heads)
+    net = M.Net(env.dex.vocab(), d=args.d, layers=args.layers, heads=args.heads).to(dev)
     opt = torch.optim.Adam(net.parameters(), lr=args.lr)
     it, trained_s, decisions_total, games_total = 0, 0.0, 0, 0
     if os.path.exists(ckpt_path):
-        ck = torch.load(ckpt_path, weights_only=False)
+        ck = torch.load(ckpt_path, map_location=dev, weights_only=False)
         net.load_state_dict(ck["net"])
         opt.load_state_dict(ck["opt"])
         it, trained_s, decisions_total, games_total = ck["it"], ck["seconds"], ck["decisions"], ck["games"]
         print(f"resumed {ckpt_path} at iteration {it} ({trained_s / 60:.1f} min trained)")
-    print(f"{sum(p.numel() for p in net.parameters())} parameters; {len(teams)} pool teams; {args.battles} battles")
+    actor = net
+    if act_dev != dev:
+        actor = M.Net(env.dex.vocab(), d=args.d, layers=args.layers, heads=args.heads).to(act_dev)
+        actor.load_state_dict(net.state_dict())
+        actor.eval()
+    gpu_name = f" ({torch.cuda.get_device_name(dev)})" if dev.type == "cuda" else ""
+    print(f"{sum(p.numel() for p in net.parameters())} parameters; {len(teams)} pool teams; {args.battles} battles; "
+          f"training on {dev}{gpu_name}, moves on {act_dev}")
     if it == 0:
-        wr = evaluate(net, teams, args.eval_games)
+        wr = evaluate(actor, teams, args.eval_games)
         print(f"untrained vs random: {wr:.1%}")
         with open(log_path, "a") as f:
             f.write(json.dumps({"it": 0, "decisions": 0, "games": 0, "minutes": 0, "vs_random": wr}) + "\n")
+
+    def on_dev(x):
+        return torch.from_numpy(x).to(dev)
 
     start = time.time()
     while time.time() - start < args.minutes * 60:
@@ -183,7 +212,7 @@ def main():
         net.eval()
         for _ in range(args.steps):
             d = env.observe()
-            choice, logp, value = act(net, d)
+            choice, logp, value = act(actor, d)
             ended = env.step(choice)
             ro.add(d, choice, logp, value, env.refused, ended)
         games = ro.finish(args.gamma, args.lam) // 2
@@ -193,26 +222,28 @@ def main():
         stats = []
         for _ in range(args.epochs):
             for mb in np.array_split(rng.permutation(ro.valid_idx), max(1, len(ro.valid_idx) // args.minibatch)):
-                t = M.to_torch(ro.batch(mb))
+                t = M.to_torch(ro.batch(mb), dev)
                 logits, v = net(t)
                 n = len(mb)
                 lp_all = M.seg_log_softmax(logits, t["seg"], n)
-                lp = lp_all[t["offsets"][:-1] + torch.from_numpy(ro.choice[mb])]
-                ratio = torch.exp(lp - torch.from_numpy(ro.logp[mb]))
-                a = torch.from_numpy(ro.adv[mb])
+                lp = lp_all[t["offsets"][:-1] + on_dev(ro.choice[mb])]
+                ratio = torch.exp(lp - on_dev(ro.logp[mb]))
+                a = on_dev(ro.adv[mb])
                 a = (a - a.mean()) / (a.std() + 1e-8)
                 pg = -torch.min(ratio * a, ratio.clamp(1 - args.clip, 1 + args.clip) * a).mean()
-                vl = ((v - torch.from_numpy(ro.ret[mb])) ** 2).mean()
-                ent = -torch.zeros(n).index_add(0, t["seg"], lp_all.exp() * lp_all).mean()
+                vl = ((v - on_dev(ro.ret[mb])) ** 2).mean()
+                ent = -torch.zeros(n, device=dev).index_add(0, t["seg"], lp_all.exp() * lp_all).mean()
                 loss = pg + args.vf * vl - args.ent * ent
                 opt.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5)
                 opt.step()
                 with torch.no_grad():
-                    kl = (torch.from_numpy(ro.logp[mb]) - lp).mean().item()
+                    kl = (on_dev(ro.logp[mb]) - lp).mean().item()
                     clipped = ((ratio - 1).abs() > args.clip).float().mean().item()
                 stats.append((pg.item(), vl.item(), ent.item(), kl, clipped))
+        if actor is not net:
+            actor.load_state_dict(net.state_dict())
         t2 = time.time()
 
         it += 1
@@ -222,9 +253,10 @@ def main():
         pg, vl, ent, kl, clipped = np.mean(stats, axis=0)
         rec = {"it": it, "decisions": decisions_total, "games": games_total, "minutes": round(trained_s / 60, 2),
                "pg": round(pg, 4), "vloss": round(vl, 4), "entropy": round(ent, 3), "kl": round(kl, 4),
-               "clipfrac": round(clipped, 3), "collect_s": round(t1 - t0, 1), "train_s": round(t2 - t1, 1)}
+               "clipfrac": round(clipped, 3), "collect_s": round(t1 - t0, 1), "train_s": round(t2 - t1, 1),
+               "per_s": round(ro.n / (t2 - t0))}
         if it % args.eval_every == 0:
-            rec["vs_random"] = evaluate(net, teams, args.eval_games)
+            rec["vs_random"] = evaluate(actor, teams, args.eval_games)
         print(json.dumps(rec), flush=True)
         with open(log_path, "a") as f:
             f.write(json.dumps(rec) + "\n")
@@ -233,7 +265,7 @@ def main():
                     "decisions": decisions_total, "games": games_total, "args": vars(args)}, tmp)
         os.replace(tmp, ckpt_path)
         if args.snapshot_every and it % args.snapshot_every == 0:
-            torch.save({"net": net.state_dict(), "it": it, "minutes": rec["minutes"], "decisions": decisions_total,
+            torch.save({"net": {k: v.detach().cpu() for k, v in net.state_dict().items()}, "it": it, "minutes": rec["minutes"], "decisions": decisions_total,
                         "games": games_total, "args": vars(args)}, os.path.join(run, f"snap_{it:05d}.pt"))
 
 

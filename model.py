@@ -30,12 +30,12 @@ def batch_from(d):
             "preview": d.preview, "pos2own": d.pos2own, "rows": d.actions, "offsets": d.offsets}
 
 
-def to_torch(b):
-    t = {k: torch.from_numpy(np.ascontiguousarray(v)) for k, v in b.items()}
+def to_torch(b, device="cpu"):
+    t = {k: torch.from_numpy(np.ascontiguousarray(v)).to(device) for k, v in b.items()}
     for k in ("ids", "slots", "pos2own", "rows", "offsets"):
         t[k] = t[k].long()
     n = len(b["preview"])
-    t["seg"] = torch.repeat_interleave(torch.arange(n), t["offsets"][1:] - t["offsets"][:-1])
+    t["seg"] = torch.repeat_interleave(torch.arange(n, device=device), t["offsets"][1:] - t["offsets"][:-1])
     return t
 
 
@@ -79,17 +79,17 @@ class Net(nn.Module):
         glob = self.glob_in(torch.cat([obs[:, OWN_CONDS:OWN_CONDS + 6], obs[:, FOE_CONDS:FOE_CONDS + 6],
                                        obs[:, FIELD:], t["glob_x"], t["preview"].float()[:, None]], -1))
         seq = torch.cat([mons.reshape(n, 12, self.d), glob[:, None]], 1)
-        pad = torch.cat([ids[..., 0].reshape(n, 12) == 0, torch.zeros(n, 1, dtype=torch.bool)], 1)
+        pad = torch.cat([ids[..., 0].reshape(n, 12) == 0, torch.zeros(n, 1, dtype=torch.bool, device=ids.device)], 1)
         out = self.norm(self.encoder(seq, src_key_padding_mask=pad))
         out = out.masked_fill(pad[..., None], 0.0)
-        H = torch.cat([out[:, :12], torch.zeros(n, 1, self.d)], 1)
+        H = torch.cat([out[:, :12], torch.zeros(n, 1, self.d, device=out.device)], 1)
         return H, out[:, 12]
 
     def forward(self, t):
         """(logits (rows,), value (n,)) for a to_torch() batch."""
         H, g = self.tokens(t)
         rows, seg, n = t["rows"], t["seg"], len(t["preview"])
-        logits = torch.empty(len(rows))
+        logits = torch.empty(len(rows), device=rows.device)
         pre = t["preview"][seg]
         if pre.any():  # team preview: positions in team order (own view = team order there), leads first
             r, s = rows[pre], seg[pre]
@@ -102,7 +102,7 @@ class Net(nn.Module):
         if mv.any():
             r, s = rows[mv], seg[mv]
             slots = t["slots"]
-            one_two = torch.tensor([1, 2])
+            one_two = torch.tensor([1, 2], device=rows.device)
             # token index of the own / foe mon in slot a and b (NULL if none)
             own_hit, foe_hit = slots[:, 0, :, None] == one_two, slots[:, 1, :, None] == one_two  # (n, 6, 2)
             own_at = torch.where(own_hit.any(1), own_hit.float().argmax(1), NULL)
@@ -135,14 +135,15 @@ class Net(nn.Module):
 def unique_first(key):
     """(unique keys, index of each one's first occurrence, inverse) for a 1-D integer tensor."""
     u, inverse = torch.unique(key, return_inverse=True)
-    first = torch.full((len(u),), len(key), dtype=torch.long).scatter_reduce(0, inverse, torch.arange(len(key)), "amin")
+    first = torch.full((len(u),), len(key), dtype=torch.long, device=key.device).scatter_reduce(
+        0, inverse, torch.arange(len(key), device=key.device), "amin")
     return u, first, inverse
 
 
 def seg_log_softmax(logits, seg, n):
     """Log-softmax within each decision's rows (rows of decision k are contiguous)."""
-    m = torch.full((n,), -torch.inf).scatter_reduce(0, seg, logits.detach(), "amax")
-    z = torch.zeros(n).index_add(0, seg, (logits - m[seg]).exp())
+    m = torch.full((n,), -torch.inf, device=logits.device).scatter_reduce(0, seg, logits.detach(), "amax")
+    z = torch.zeros(n, device=logits.device).index_add(0, seg, (logits - m[seg]).exp())
     return logits - (m + z.log())[seg]
 
 
@@ -150,7 +151,8 @@ def sample(logits, seg, offsets, greedy=False):
     """One row per decision (Gumbel-max, or argmax): the choice index within the decision, as numpy."""
     n = len(offsets) - 1
     g = logits if greedy else logits - torch.log(-torch.log(torch.rand_like(logits).clamp(1e-12, 1 - 1e-7)))
-    m = torch.full((n,), -torch.inf).scatter_reduce(0, seg, g, "amax")
-    first = torch.full((n,), len(g), dtype=torch.long).scatter_reduce(
-        0, seg[g == m[seg]], torch.arange(len(g))[g == m[seg]], "amin")
-    return (first - offsets[:-1]).numpy()
+    m = torch.full((n,), -torch.inf, device=g.device).scatter_reduce(0, seg, g, "amax")
+    top = g == m[seg]
+    first = torch.full((n,), len(g), dtype=torch.long, device=g.device).scatter_reduce(
+        0, seg[top], torch.arange(len(g), device=g.device)[top], "amin")
+    return (first - offsets[:-1]).cpu().numpy()
