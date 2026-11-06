@@ -1,6 +1,7 @@
 """PPO self-play on the Reg M-C team pool, closed team sheets.
 
-Usage: python train.py [--minutes 30] [--run NAME] [--battles 256] [--steps 32] [--d 64 --layers 2] ...
+Usage: python train.py [--minutes 30] [--run NAME] [--battles 256] [--steps 32] [--d 64 --layers 2]
+                       [--pfsp 0.5] [--target-kl 0.01] ...
 
 One network (model.Net) plays both sides of `--battles` battles between random pool teams (selfplay.SelfPlay).
 Every `--steps` env steps the decisions collected train it with PPO: reward +1 win / -1 loss / 0 draw at the end
@@ -8,6 +9,11 @@ of a game, nothing before (GAE over each player's own decisions). Every `--eval-
 uniformly random player and logs its win rate. Checkpoint + log in <runs-dir>/<NAME>/ (resumes if present, so a
 cloud session that restarts just runs the same command again), plus a snapshot of the network every
 `--snapshot-every` iterations (snap_<iteration>.pt, CPU tensors) for arena.py to play against.
+
+PFSP (--pfsp F): in a fraction F of the battles one side is played by a past snapshot of this run instead (see
+League); only the learner's decisions there are trained on. --target-kl adapts the learning rate after every
+iteration so the mean KL per update stays near it (--lr is then the ceiling); without it the rate is --lr, also
+on resume.
 
 GPU: --device cuda (the default when one is there) trains on it; the battles always run on the CPU. Moves during
 the rollouts are picked on --act-device (default: the same device); `--act-device cpu` keeps a CPU copy of the
@@ -130,10 +136,106 @@ def evaluate(net, teams, games, battles=64, seed=12345):
 def subset(d, k):
     """The decisions k of a Decisions (with their action rows)."""
     c = d.counts()[k]
-    rows = np.concatenate([np.arange(d.offsets[i], d.offsets[i + 1]) for i in k])
+    rows = np.repeat(d.offsets[k] - np.r_[0, np.cumsum(c)[:-1]], c) + np.arange(c.sum())
     return sp.Decisions(battle=d.battle[k], side=d.side[k], preview=d.preview[k], obs=d.obs[k], ids=d.ids[k],
                         actions=d.actions[rows], offsets=np.r_[0, np.cumsum(c)], slots=d.slots[k],
                         pos2own=d.pos2own[k], mon_x=d.mon_x[k], glob_x=d.glob_x[k])
+
+
+def load_net(path, vocab, device="cpu"):
+    """A checkpoint or snapshot as an eval-mode Net on `device` (its size comes from the args saved with it)."""
+    ck = torch.load(path, map_location=device, weights_only=False)
+    a = ck["args"]
+    net = M.Net(vocab, d=a["d"], layers=a["layers"], heads=a["heads"]).to(device)
+    net.load_state_dict(ck["net"])
+    net.eval()
+    return net
+
+
+class League:
+    """Prioritized fictitious self-play (AlphaStar's "hard" PFSP) against this run's own snapshots.
+
+    In the first round(frac * battles) battle slots one side (random per game) is the learner and the other a past
+    snapshot. Every iteration, refresh() draws up to k snapshots, each with weight (1 - p)^2, p = the learner's
+    recent score against it (an exponential average over its games, 0.5 before any): the ones it struggles with come
+    up most, the ones it beats easily hardly ever. A league slot keeps its opponent for the whole game and draws a
+    new one (and a new side) from the current draw when the game ends. Until the first snapshot exists, league
+    slots are plain self-play.
+    """
+
+    ALPHA = 0.02  # weight of one game in the score average (~50 games of memory)
+
+    def __init__(self, run, frac, battles, k, vocab, device, rng, state=None):
+        self.run, self.k, self.vocab, self.device, self.rng = run, k, vocab, device, rng
+        self.n = int(round(frac * battles))
+        self.opp = np.full(battles, -1, np.int64)  # per slot: index into self.files, -1 = self-play
+        self.side = rng.integers(2, size=battles)  # per slot: the learner's side
+        self.files, self.fid, self.nets, self.active = [], {}, {}, []
+        self.p = dict((state or {}).get("p", {}))  # snapshot file -> learner's score against it
+        self.started = False
+        self.score = self.games = 0.0
+
+    def _id(self, f):
+        if f not in self.fid:
+            self.fid[f] = len(self.files)
+            self.files.append(f)
+        return self.fid[f]
+
+    def _draw(self, slot):
+        self.opp[slot] = self._id(self.active[self.rng.integers(len(self.active))])
+        self.side[slot] = self.rng.integers(2)
+
+    def refresh(self):
+        """New draw of opponents for this iteration (call before its first observe)."""
+        snaps = sorted(f for f in os.listdir(self.run) if f.startswith("snap_") and f.endswith(".pt"))
+        if snaps:
+            w = np.array([(1 - self.p.get(f, 0.5)) ** 2 for f in snaps]) + 1e-4
+            pick = self.rng.choice(len(snaps), size=min(self.k, len(snaps)), replace=False, p=w / w.sum())
+            self.active = [snaps[i] for i in pick]
+            if not self.started:  # the env was just created: every game is at its start
+                for slot in range(self.n):
+                    self._draw(slot)
+        self.started = True
+        keep = set(self.active) | {self.files[j] for j in set(self.opp.tolist()) if j >= 0}
+        if len(self.nets) > 4 * self.k:
+            for f in [f for f in self.nets if f not in keep]:
+                del self.nets[f]
+
+    def net(self, f):
+        if f not in self.nets:
+            self.nets[f] = load_net(os.path.join(self.run, f), self.vocab, self.device)
+        return self.nets[f]
+
+    def split(self, d):
+        """(mask of the learner's decisions, {snapshot file: indices of the decisions it plays})."""
+        o = self.opp[d.battle]
+        theirs = (o >= 0) & (d.side != self.side[d.battle])
+        return ~theirs, {self.files[j]: np.flatnonzero(theirs & (o == j)) for j in np.unique(o[theirs]).tolist()}
+
+    def ended(self, ended):
+        """Score the league games that ended (env.step's list) and give their slots new opponents."""
+        for slot, winner, _ in ended:
+            j = self.opp[slot]
+            if j >= 0:
+                f = self.files[j]
+                s = 0.5 if winner is None else float(winner == self.side[slot])
+                p = self.p.get(f, 0.5)
+                self.p[f] = p + self.ALPHA * (s - p)
+                self.score += s
+                self.games += 1
+            if slot < self.n and self.active:
+                self._draw(slot)
+
+    def stats(self):
+        """Log fields for the iteration (and a reset): score vs the league, games, the iterations drawn."""
+        rec = {"league": round(self.score / self.games, 3) if self.games else None, "league_games": int(self.games),
+               "opp": [int(f[5:-3]) for f in self.active]}
+        self.score = self.games = 0.0
+        return rec
+
+    def hardest(self, n=3):
+        """The n snapshots with the lowest learner score so far, as [iteration, score]."""
+        return [[int(f[5:-3]), round(p, 3)] for f, p in sorted(self.p.items(), key=lambda x: x[1])[:n]]
 
 
 def main():
@@ -149,7 +251,13 @@ def main():
     ap.add_argument("--d", type=int, default=64)
     ap.add_argument("--layers", type=int, default=2)
     ap.add_argument("--heads", type=int, default=4)
-    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--lr", type=float, default=3e-4, help="learning rate (with --target-kl: its ceiling)")
+    ap.add_argument("--target-kl", type=float, default=0,
+                    help="adapt the learning rate so the mean KL per update stays near this (0: constant --lr)")
+    ap.add_argument("--lr-min", type=float, default=1e-5, help="floor of the adapted learning rate")
+    ap.add_argument("--pfsp", type=float, default=0,
+                    help="fraction of the battles where one side is a past snapshot of this run (0: pure self-play)")
+    ap.add_argument("--pfsp-opponents", type=int, default=4, help="snapshots drawn per iteration")
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--minibatch", type=int, default=2048)
     ap.add_argument("--clip", type=float, default=0.2)
@@ -181,21 +289,30 @@ def main():
     env = sp.SelfPlay(teams, args.battles, seed=args.seed)
     net = M.Net(env.dex.vocab(), d=args.d, layers=args.layers, heads=args.heads).to(dev)
     opt = torch.optim.Adam(net.parameters(), lr=args.lr)
-    it, trained_s, decisions_total, games_total = 0, 0.0, 0, 0
+    it, trained_s, decisions_total, games_total, ck = 0, 0.0, 0, 0, {}
     if os.path.exists(ckpt_path):
         ck = torch.load(ckpt_path, map_location=dev, weights_only=False)
         net.load_state_dict(ck["net"])
-        opt.load_state_dict(ck["opt"])
+        opt.load_state_dict(ck["opt"])  # this also restores the saved learning rate
         it, trained_s, decisions_total, games_total = ck["it"], ck["seconds"], ck["decisions"], ck["games"]
         print(f"resumed {ckpt_path} at iteration {it} ({trained_s / 60:.1f} min trained)")
+    lr = float(np.clip(opt.param_groups[0]["lr"], args.lr_min, args.lr)) if args.target_kl and ck else args.lr
+    for g in opt.param_groups:
+        g["lr"] = lr
     actor = net
     if act_dev != dev:
         actor = M.Net(env.dex.vocab(), d=args.d, layers=args.layers, heads=args.heads).to(act_dev)
         actor.load_state_dict(net.state_dict())
         actor.eval()
     gpu_name = f" ({torch.cuda.get_device_name(dev)})" if dev.type == "cuda" else ""
+    league = None
+    if args.pfsp:
+        league = League(run, args.pfsp, args.battles, args.pfsp_opponents, env.dex.vocab(), act_dev, rng,
+                        state=ck.get("pfsp"))
     print(f"{sum(p.numel() for p in net.parameters())} parameters; {len(teams)} pool teams; {args.battles} battles; "
-          f"training on {dev}{gpu_name}, moves on {act_dev}")
+          f"training on {dev}{gpu_name}, moves on {act_dev}; lr {lr:.3g}"
+          + (f", target KL {args.target_kl}" if args.target_kl else "")
+          + (f"; PFSP in {league.n} battles, {args.pfsp_opponents} snapshots per iteration" if league else ""))
     if it == 0:
         wr = evaluate(actor, teams, args.eval_games)
         print(f"untrained vs random: {wr:.1%}")
@@ -210,12 +327,32 @@ def main():
         t0 = time.time()
         ro = Rollout()
         net.eval()
+        games = played = 0
+        if league:
+            league.refresh()
         for _ in range(args.steps):
             d = env.observe()
-            choice, logp, value = act(actor, d)
-            ended = env.step(choice)
-            ro.add(d, choice, logp, value, env.refused, ended)
-        games = ro.finish(args.gamma, args.lam) // 2
+            if league is None:
+                choice, logp, value = act(actor, d)
+                ended = env.step(choice)
+                ro.add(d, choice, logp, value, env.refused, ended)
+            else:  # the learner's decisions are trained on, the snapshots' only played
+                mine, theirs = league.split(d)
+                dl = d if mine.all() else subset(d, np.flatnonzero(mine))
+                choice = np.zeros(d.n, np.int64)
+                if dl.n:
+                    c, logp, value = act(actor, dl)
+                    choice[mine] = c
+                else:
+                    c, logp, value = np.zeros(0, np.int64), np.zeros(0, np.float32), np.zeros(0, np.float32)
+                for f, k in theirs.items():
+                    choice[k] = act(league.net(f), subset(d, k))[0]
+                ended = env.step(choice)
+                ro.add(dl, c, logp, value, env.refused[mine], ended)  # always: it scores the games that ended
+                league.ended(ended)
+            games += len(ended)
+            played += d.n
+        ro.finish(args.gamma, args.lam)
         t1 = time.time()
 
         net.train()
@@ -254,15 +391,25 @@ def main():
         rec = {"it": it, "decisions": decisions_total, "games": games_total, "minutes": round(trained_s / 60, 2),
                "pg": round(pg, 4), "vloss": round(vl, 4), "entropy": round(ent, 3), "kl": round(kl, 4),
                "clipfrac": round(clipped, 3), "collect_s": round(t1 - t0, 1), "train_s": round(t2 - t1, 1),
-               "per_s": round(ro.n / (t2 - t0))}
+               "per_s": round(ro.n / (t2 - t0)), "lr": float(f"{lr:.3g}")}
+        if league:
+            rec.update(league.stats(), played=played)
+        if args.target_kl:  # KL grows ~ with lr^2: aim at the target, at most x1.5 or x2/3 per iteration
+            lr = float(np.clip(lr * np.clip(np.sqrt(args.target_kl / max(kl, 1e-8)), 2 / 3, 1.5),
+                               args.lr_min, args.lr))
+            for g in opt.param_groups:
+                g["lr"] = lr
         if it % args.eval_every == 0:
             rec["vs_random"] = evaluate(actor, teams, args.eval_games)
+            if league:
+                rec["hardest"] = league.hardest()
         print(json.dumps(rec), flush=True)
         with open(log_path, "a") as f:
             f.write(json.dumps(rec) + "\n")
         tmp = ckpt_path + ".tmp"
         torch.save({"net": net.state_dict(), "opt": opt.state_dict(), "it": it, "seconds": trained_s,
-                    "decisions": decisions_total, "games": games_total, "args": vars(args)}, tmp)
+                    "decisions": decisions_total, "games": games_total, "args": vars(args),
+                    "pfsp": {"p": league.p} if league else ck.get("pfsp")}, tmp)
         os.replace(tmp, ckpt_path)
         if args.snapshot_every and it % args.snapshot_every == 0:
             torch.save({"net": {k: v.detach().cpu() for k, v in net.state_dict().items()}, "it": it, "minutes": rec["minutes"], "decisions": decisions_total,
